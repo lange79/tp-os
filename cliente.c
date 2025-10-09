@@ -8,6 +8,7 @@
 #include <fcntl.h>
 #include <sys/time.h>
 #include <errno.h>
+#include <sys/select.h>
 
 #define MAX_BUFFER 2048
 #define CONNECTION_TIMEOUT 5
@@ -99,11 +100,11 @@ int main(int argc, char *argv[]) {
 
     printf("Conexión TCP establecida. Esperando confirmación del servidor...\n");
 
-    char status_buffer[32];
+    char status_buffer[64];
     int read_size = recv(sock, status_buffer, sizeof(status_buffer) - 1, 0);
 
     if (read_size <= 0) {
-        printf("El servidor cerró la conexión prematuramente.\n");
+        printf("Se perdió la conexión con el servidor, intente nuevamente.\n");
         close(sock);
         return 1;
     }
@@ -113,14 +114,14 @@ int main(int argc, char *argv[]) {
         printf("Servidor ocupado. Has sido puesto en la cola de espera...\n");
         read_size = recv(sock, status_buffer, sizeof(status_buffer) - 1, 0);
         if (read_size <= 0) {
-            printf("El servidor cerró la conexión mientras esperabas.\n");
+            printf("Se perdió la conexión con el servidor, intente nuevamente.\n");
             close(sock);
             return 1;
         }
         status_buffer[read_size] = '\0';
     }
     if (strcmp(status_buffer, "STATUS|CONNECTED") != 0) {
-        printf("Error de protocolo o servidor en apagado: %s\n", status_buffer);
+        printf("Respuesta inesperada del servidor: %s\n", status_buffer);
         close(sock);
         return 1;
     }
@@ -128,29 +129,48 @@ int main(int argc, char *argv[]) {
     printf("\n¡Conexión activa establecida con el servidor!\n");
     mostrar_ayuda();
     
+    fd_set read_fds;
     while (1) {
         printf("> ");
-        fgets(message, MAX_BUFFER, stdin);
-        message[strcspn(message, "\r\n")] = 0;
-        if (strcmp(message, "HELP") == 0 || strcmp(message, "?") == 0) {
-            mostrar_ayuda();
-            continue;
-        }
-        if (send(sock, message, strlen(message), 0) < 0) {
-            puts("Send failed");
+        fflush(stdout);
+
+        FD_ZERO(&read_fds);
+        FD_SET(STDIN_FILENO, &read_fds);
+        FD_SET(sock, &read_fds);
+
+        if (select(sock + 1, &read_fds, NULL, NULL, NULL) < 0) {
+            perror("select");
             break;
         }
-        if (strcmp(message, "EXIT") == 0) {
-            printf("Desconectando...\n");
-            break;
+
+        if (FD_ISSET(sock, &read_fds)) {
+            int reply_size = recv(sock, server_reply, MAX_BUFFER - 1, 0);
+            if (reply_size > 0) {
+                server_reply[reply_size] = '\0';
+                printf("\rServidor: %s\n> ", server_reply);
+                fflush(stdout);
+            } else {
+                 printf("\rSe perdió la conexión con el servidor, intente nuevamente.\n");
+                 break;
+            }
         }
-        int reply_size = recv(sock, server_reply, MAX_BUFFER - 1, 0);
-        if (reply_size > 0) {
-            server_reply[reply_size] = '\0';
-            printf("Servidor: %s\n", server_reply);
-        } else {
-             printf("El servidor cerró la conexión.\n");
-             break;
+        
+        if (FD_ISSET(STDIN_FILENO, &read_fds)) {
+            if (fgets(message, MAX_BUFFER, stdin) == NULL) break;
+            
+            message[strcspn(message, "\r\n")] = 0;
+            if (strcmp(message, "HELP") == 0 || strcmp(message, "?") == 0) {
+                mostrar_ayuda();
+                continue;
+            }
+            if (send(sock, message, strlen(message), 0) < 0) {
+                puts("Send failed");
+                break;
+            }
+            if (strcmp(message, "EXIT") == 0) {
+                printf("Desconectando...\n");
+                break;
+            }
         }
     }
     close(sock);

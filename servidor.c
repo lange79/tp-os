@@ -54,10 +54,11 @@ void load_csv_header() {
         csv_header[strcspn(csv_header, "\r\n")] = 0;
         char header_copy[1024];
         strcpy(header_copy, csv_header);
-        char *token = strtok(header_copy, ";");
+        char *token, *saveptr;
+        token = strtok_r(header_copy, ";", &saveptr);
         while (token != NULL && column_count < MAX_COLS) {
             column_names[column_count++] = strdup(token);
-            token = strtok(NULL, ";");
+            token = strtok_r(NULL, ";", &saveptr);
         }
     }
     fclose(fs);
@@ -96,14 +97,20 @@ void *handle_client(void *args) {
     char temp_file_name[256];
     char current_data_source[256];
 
-    // << INICIO: MODIFICACIÓN DE LOGS >>
     char client_ip[INET_ADDRSTRLEN];
     inet_ntop(AF_INET, &(thread_args->client_address.sin_addr), client_ip, INET_ADDRSTRLEN);
     int client_port = ntohs(thread_args->client_address.sin_port);
-    // << FIN: MODIFICACIÓN DE LOGS >>
-
 
     pthread_mutex_lock(&count_mutex);
+    if (waiting_clients_count >= max_waiting_clients_config) {
+        printf(">> Conexión de %s:%d rechazada: Cola de espera llena.\n", client_ip, client_port);
+        send(client_socket, "ERROR|Cola de espera llena. Intente más tarde.", 46, 0);
+        pthread_mutex_unlock(&count_mutex);
+        close(client_socket);
+        free(args);
+        return NULL;
+    }
+    
     while (active_clients_count >= max_concurrent_clients_config && !shutdown_flag) {
         send(client_socket, "STATUS|QUEUED", 13, 0);
         waiting_clients_count++;
@@ -133,20 +140,24 @@ void *handle_client(void *args) {
         char response[MAX_BUFFER] = "ERROR|Comando desconocido";
         char temp_buffer[MAX_BUFFER];
         strcpy(temp_buffer, buffer);
+        char *saveptr1;
 
         if (strcmp(temp_buffer, "BEGIN TRANSACTION") == 0) {
             if (in_transaction) { strcpy(response, "ERROR|Ya hay una transacción activa."); }
             else {
-                pthread_mutex_lock(&file_lock_mutex);
-                struct flock lock = {.l_type = F_WRLCK, .l_whence = SEEK_SET, .l_start = 0, .l_len = 0};
-                if (fcntl(file_fd, F_SETLK, &lock) == -1) {
-                    strcpy(response, "ERROR|El archivo está bloqueado por otra transacción.");
-                    pthread_mutex_unlock(&file_lock_mutex);
+                if (pthread_mutex_trylock(&file_lock_mutex) != 0) {
+                    strcpy(response, "ERROR|El archivo está bloqueado por otra transacción. Intente más tarde.");
                 } else {
-                    sprintf(temp_file_name, "datos_%ld.tmp", (long)pthread_self());
-                    strcpy(current_data_source, CSV_FILE);
-                    in_transaction = 1;
-                    strcpy(response, "OK|Transacción iniciada.");
+                    struct flock lock = {.l_type = F_WRLCK, .l_whence = SEEK_SET, .l_start = 0, .l_len = 0};
+                    if (fcntl(file_fd, F_SETLK, &lock) == -1) {
+                        strcpy(response, "ERROR|Fallo al bloquear el archivo.");
+                        pthread_mutex_unlock(&file_lock_mutex);
+                    } else {
+                        sprintf(temp_file_name, "datos_%ld.tmp", (long)pthread_self());
+                        strcpy(current_data_source, CSV_FILE);
+                        in_transaction = 1;
+                        strcpy(response, "OK|Transacción iniciada.");
+                    }
                 }
             }
         } else if (strcmp(temp_buffer, "COMMIT TRANSACTION") == 0) {
@@ -174,7 +185,7 @@ void *handle_client(void *args) {
         } else if (strncmp(temp_buffer, "INSERT", 6) == 0 || strncmp(temp_buffer, "DELETE", 6) == 0 || strncmp(temp_buffer, "UPDATE", 6) == 0) {
             if (!in_transaction) { strcpy(response, "ERROR|Esta operación requiere una transacción."); }
             else {
-                char *command = strtok(temp_buffer, "|");
+                char *command = strtok_r(temp_buffer, "|", &saveptr1);
                 char next_temp_file[256];
                 
                 int len = snprintf(next_temp_file, sizeof(next_temp_file), "%s_next", temp_file_name);
@@ -187,8 +198,8 @@ void *handle_client(void *args) {
                     if (!source || !dest) { strcpy(response, "ERROR|No se pudieron abrir los archivos de la transacción."); }
                     else {
                         if (strcasecmp(command, "INSERT") == 0) {
-                            char *nombre = strtok(NULL, "|"); char *apellido = strtok(NULL, "|");
-                            char *anio = strtok(NULL, "|"); char *materia = strtok(NULL, "|");
+                            char *nombre = strtok_r(NULL, "|", &saveptr1); char *apellido = strtok_r(NULL, "|", &saveptr1);
+                            char *anio = strtok_r(NULL, "|", &saveptr1); char *materia = strtok_r(NULL, "|", &saveptr1);
                             if (!nombre || !apellido || !anio || !materia) { strcpy(response, "ERROR|Sintaxis: INSERT|<Nombre>|<Apellido>|<Anio>|<Materia>"); }
                             else {
                                 int new_id = find_first_free_id(current_data_source);
@@ -198,9 +209,9 @@ void *handle_client(void *args) {
                                 sprintf(response, "OK|Registro insertado temporalmente con ID %d.", new_id);
                             }
                         } else if (strcasecmp(command, "DELETE") == 0) {
-                            char *id_str = strtok(NULL, "|"); char *nombre = strtok(NULL, "|");
-                            char *apellido = strtok(NULL, "|"); char *anio = strtok(NULL, "|");
-                            char *materia = strtok(NULL, "|");
+                            char *id_str = strtok_r(NULL, "|", &saveptr1); char *nombre = strtok_r(NULL, "|", &saveptr1);
+                            char *apellido = strtok_r(NULL, "|", &saveptr1); char *anio = strtok_r(NULL, "|", &saveptr1);
+                            char *materia = strtok_r(NULL, "|", &saveptr1);
                             if (!id_str || !nombre || !apellido || !anio || !materia) { strcpy(response, "ERROR|Sintaxis: DELETE|<ID>|<Nombre>|<Apellido>|<Anio>|<Materia>"); }
                             else {
                                 char line[1024]; int deleted = 0;
@@ -209,7 +220,8 @@ void *handle_client(void *args) {
                                 while(fgets(line, sizeof(line), source)) {
                                     line[strcspn(line, "\r\n")] = 0;
                                     char line_copy[1024]; strcpy(line_copy, line);
-                                    char *line_id = strtok(line_copy, ";");
+                                    char *saveptr2;
+                                    char *line_id = strtok_r(line_copy, ";", &saveptr2);
                                     if (strcmp(line_id, id_str) == 0) {
                                         char full_record_to_match[1024];
                                         sprintf(full_record_to_match, "%s;%s;%s;%s;%s", id_str, nombre, apellido, anio, materia);
@@ -226,8 +238,8 @@ void *handle_client(void *args) {
                                 else sprintf(response, "ERROR|No se encontró un registro que coincida con todos los datos para el ID %s.", id_str);
                             }
                         } else if (strcasecmp(command, "UPDATE") == 0) {
-                            char *id_str = strtok(NULL, "|"); char *col_name = strtok(NULL, "|");
-                            char *new_val = strtok(NULL, "|");
+                            char *id_str = strtok_r(NULL, "|", &saveptr1); char *col_name = strtok_r(NULL, "|", &saveptr1);
+                            char *new_val = strtok_r(NULL, "|", &saveptr1);
                             if (!id_str || !col_name || !new_val) { strcpy(response, "ERROR|Sintaxis: UPDATE|<ID>|<columna>|<nuevo_valor>"); }
                             else {
                                 int col_idx = get_column_index(col_name);
@@ -239,12 +251,14 @@ void *handle_client(void *args) {
                                     while(fgets(line, sizeof(line), source)) {
                                         line[strcspn(line, "\r\n")] = 0;
                                         char line_copy[1024]; strcpy(line_copy, line);
-                                        char *line_id = strtok(line_copy, ";");
+                                        char *saveptr2;
+                                        char *line_id = strtok_r(line_copy, ";", &saveptr2);
                                         if (strcmp(line_id, id_str) == 0) {
                                             char *fields[MAX_COLS]; int i = 0;
                                             strcpy(line_copy, line);
-                                            char *token = strtok(line_copy, ";");
-                                            while(token && i < column_count) { fields[i++] = token; token = strtok(NULL, ";"); }
+                                            char *token, *saveptr3;
+                                            token = strtok_r(line_copy, ";", &saveptr3);
+                                            while(token && i < column_count) { fields[i++] = token; token = strtok_r(NULL, ";", &saveptr3); }
                                             fields[col_idx] = new_val;
                                             for(int j=0; j<column_count; j++) fprintf(dest, "%s%s", fields[j], (j == column_count - 1 ? "" : ";"));
                                             fprintf(dest, "\n");
@@ -272,7 +286,7 @@ void *handle_client(void *args) {
             if (lock_check.l_type != F_UNLCK && !in_transaction) { strcpy(response, "ERROR|Hay una transacción activa. No se pueden realizar consultas."); }
             else {
                 const char *source_to_read = in_transaction ? current_data_source : CSV_FILE;
-                strtok(temp_buffer, "|"); char *argument = strtok(NULL, "|");
+                char *argument = strtok_r(temp_buffer, "|", &saveptr1) ? strtok_r(NULL, "|", &saveptr1) : NULL;
                 if (argument != NULL && strcasecmp(argument, "ALL") == 0) {
                     FILE *fs = fopen(source_to_read, "r");
                     if (fs) {
@@ -286,7 +300,7 @@ void *handle_client(void *args) {
                         fclose(fs);
                     } else { strcpy(response, "ERROR|No se pudo abrir el archivo de datos."); }
                 } else {
-                    char *column_to_find = argument; char *value_to_find = strtok(NULL, "|");
+                    char *column_to_find = argument; char *value_to_find = strtok_r(NULL, "|", &saveptr1);
                     if (!column_to_find || !value_to_find) { strcpy(response, "ERROR|Sintaxis incorrecta. Use FIND|<columna>|<valor>."); }
                     else {
                         int col_index = get_column_index(column_to_find);
@@ -298,7 +312,9 @@ void *handle_client(void *args) {
                                 sprintf(response, "DATA|\n%s\n", csv_header);
                                 fgets(line_buffer, sizeof(line_buffer), fs);
                                 while(fgets(line_buffer, sizeof(line_buffer), fs) != NULL) {
-                                    char *line_copy = strdup(line_buffer); char *field = strtok(line_copy, ";");
+                                    char *line_copy = strdup(line_buffer); 
+                                    char *saveptr2;
+                                    char *field = strtok_r(line_copy, ";", &saveptr2);
                                     int current_col = 0; int found_in_line = 0;
                                     while (field != NULL) {
                                         if (current_col == col_index) {
@@ -306,7 +322,7 @@ void *handle_client(void *args) {
                                             if (strcasecmp(field, value_to_find) == 0) { found_in_line = 1; }
                                             break;
                                         }
-                                        field = strtok(NULL, ";"); current_col++;
+                                        field = strtok_r(NULL, ";", &saveptr2); current_col++;
                                     }
                                     free(line_copy);
                                     if (found_in_line) {
