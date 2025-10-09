@@ -1,10 +1,7 @@
 ID;Nombre;Apellido;Anio;Materia
-1;Julian;Lopez;3;Sistemas operativos
-3;JUAN;PEREZ;1;Algebra
-4;Pedro;Lopez;2;Fisica
-5;Nicolas;Fernandez;4;Seguridad de la informacion
-6;Laura;Gutierrez;2;Calculo
-2;Micaela;Gonzalez;1;Desarrollo de Software
-7;Sofia;Rodriguez;3;SO
-8;Julian;Alvarez;5;Proyecto
-9;NOMBRE;APELLIDO;anio;MATERIA
+1;Julian;Lopez;3;Sistemas Operativos
+3;JUAN;Gonzalez;3;Topicos de programacion
+2;Roberto;Alvarez;1;Algebra
+4;Micaela;Sosa;4;Programacion avanzada
+5;julian;lopez;3;Abnalisis de sistemas
+6;Pablo;Linares;5;Proyecto

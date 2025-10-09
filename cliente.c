@@ -9,19 +9,20 @@
 #include <sys/time.h>
 #include <errno.h>
 #include <sys/select.h>
+#include <ctype.h>
 
 #define MAX_BUFFER 2048
 #define CONNECTION_TIMEOUT 5
 
 void mostrar_ayuda() {
-    printf("\n--- Comandos Admitidos (no distingue mayúsculas/minúsculas) ---\n");
+    printf("\n--- Comandos Admitidos (búsquedas no distinguen mayúsculas/minúsculas) ---\n");
     printf("CONSULTAS:\n");
     printf("  FIND|ALL                      - Muestra todos los registros.\n");
     printf("  FIND|<columna>|<valor>        - Busca un valor en una columna específica.\n");
     printf("    Columnas válidas: ID, Nombre, Apellido, Anio, Materia\n");
-    printf("\nMODIFICACIONES (requieren transacción):\n");
+    printf("\nMODIFICACIONES (requieren transacción, se guardan como se escriben):\n");
     printf("  INSERT|<Nombre>|<Apellido>|<Anio>|<Materia>\n");
-    printf("  DELETE|<ID>|<Nombre>|<Apellido>|<Anio>|<Materia>\n");
+    printf("  DELETE|<ID>                   - Inicia el borrado interactivo de un registro.\n");
     printf("  UPDATE|<ID>|<columna>|<nuevo_valor>\n");
     printf("\nTRANSACCIONES:\n");
     printf("  BEGIN TRANSACTION             - Inicia una transacción y bloquea el archivo.\n");
@@ -147,8 +148,30 @@ int main(int argc, char *argv[]) {
             int reply_size = recv(sock, server_reply, MAX_BUFFER - 1, 0);
             if (reply_size > 0) {
                 server_reply[reply_size] = '\0';
-                printf("\rServidor: %s\n> ", server_reply);
-                fflush(stdout);
+
+                if (strncmp(server_reply, "CONFIRM_DELETE|", 15) == 0) {
+                    char *record_to_delete = server_reply + 15;
+                    printf("\nSe encontró el siguiente registro:\n");
+                    printf("  %s\n", record_to_delete);
+                    printf("¿Está seguro de que desea borrar este registro? (S/N): ");
+                    fflush(stdout);
+
+                    char confirm_buffer[10];
+                    if (fgets(confirm_buffer, sizeof(confirm_buffer), stdin)) {
+                        if (toupper(confirm_buffer[0]) == 'S') {
+                            char final_delete_cmd[MAX_BUFFER];
+                            snprintf(final_delete_cmd, sizeof(final_delete_cmd), "DELETE_CONFIRMED|%s", record_to_delete);
+                            send(sock, final_delete_cmd, strlen(final_delete_cmd), 0);
+                        } else {
+                            printf("Borrado cancelado por el usuario.\n> ");
+                            fflush(stdout);
+                        }
+                    }
+                    continue;
+                } else {
+                    printf("\rServidor: %s\n> ", server_reply);
+                    fflush(stdout);
+                }
             } else {
                  printf("\rSe perdió la conexión con el servidor, intente nuevamente.\n");
                  break;

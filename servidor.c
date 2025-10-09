@@ -13,10 +13,11 @@
 #include <limits.h>
 #include <strings.h>
 #include <time.h>
-#include <ctype.h> // Para toupper()
+#include <ctype.h>
+#include <stdbool.h>
 
 #define MAX_BUFFER 2048
-#define CSV_FILE "alumnos.csv" // <<-- NOMBRE DE ARCHIVO ACTUALIZADO
+#define CSV_FILE "alumnos.csv"
 #define MAX_COLS 10
 
 // --- Variables globales para el estado del servidor ---
@@ -41,18 +42,10 @@ typedef struct {
 int file_fd;
 pthread_mutex_t file_lock_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-// --- Nueva función para Timestamps ---
 void get_timestamp(char *buffer, size_t size) {
     time_t now = time(NULL);
     struct tm *t = localtime(&now);
     strftime(buffer, size, "[%H:%M:%S]", t);
-}
-
-// --- Nueva función para normalizar a Mayúsculas ---
-void toUpperCase(char *str) {
-    for (int i = 0; str[i]; i++) {
-        str[i] = toupper((unsigned char)str[i]);
-    }
 }
 
 void print_server_status() {
@@ -165,6 +158,7 @@ void *handle_client(void *args) {
         char temp_buffer[MAX_BUFFER];
         strcpy(temp_buffer, buffer);
         char *saveptr1;
+        bool response_sent = false;
 
         if (strcmp(temp_buffer, "BEGIN TRANSACTION") == 0) {
             if (in_transaction) { strcpy(response, "ERROR|Ya hay una transacción activa."); }
@@ -187,9 +181,9 @@ void *handle_client(void *args) {
         } else if (strcmp(temp_buffer, "COMMIT TRANSACTION") == 0) {
             if (!in_transaction) { strcpy(response, "ERROR|No hay una transacción activa."); }
             else {
-                if (access(temp_file_name, F_OK) == 0) {
-                    if (rename(temp_file_name, CSV_FILE) == 0) strcpy(response, "OK|Transacción confirmada. Cambios guardados.");
-                    else { strcpy(response, "ERROR|Fallo crítico al guardar los cambios."); remove(temp_file_name); }
+                if (strcmp(current_data_source, CSV_FILE) != 0) {
+                    if (rename(current_data_source, CSV_FILE) == 0) strcpy(response, "OK|Transacción confirmada. Cambios guardados.");
+                    else { strcpy(response, "ERROR|Fallo crítico al guardar los cambios."); remove(current_data_source); }
                 } else { strcpy(response, "OK|Transacción confirmada. No se realizaron cambios."); }
                 in_transaction = 0;
                 struct flock lock = {.l_type = F_UNLCK, .l_whence = SEEK_SET, .l_start = 0, .l_len = 0};
@@ -199,7 +193,7 @@ void *handle_client(void *args) {
         } else if (strcmp(temp_buffer, "ROLLBACK TRANSACTION") == 0) {
             if (!in_transaction) { strcpy(response, "ERROR|No hay una transacción activa para revertir."); }
             else {
-                remove(temp_file_name);
+                if(strcmp(current_data_source, CSV_FILE) != 0) remove(current_data_source);
                 in_transaction = 0;
                 struct flock lock = {.l_type = F_UNLCK, .l_whence = SEEK_SET, .l_start = 0, .l_len = 0};
                 fcntl(file_fd, F_SETLK, &lock);
@@ -214,10 +208,11 @@ void *handle_client(void *args) {
                 
                 int len = snprintf(next_temp_file, sizeof(next_temp_file), "%s_next", temp_file_name);
                 if (len >= sizeof(next_temp_file)) {
-                    strcpy(response, "ERROR|Nombre de archivo temporal demasiado largo. Abortando transacción.");
+                    strcpy(response, "ERROR|Nombre de archivo temporal demasiado largo.");
                 } else {
                     FILE *source = fopen(current_data_source, "r");
                     FILE *dest = fopen(next_temp_file, "w");
+                    bool operation_successful = false;
                     
                     if (!source || !dest) { strcpy(response, "ERROR|No se pudieron abrir los archivos de la transacción."); }
                     else {
@@ -226,44 +221,84 @@ void *handle_client(void *args) {
                             char *anio = strtok_r(NULL, "|", &saveptr1); char *materia = strtok_r(NULL, "|", &saveptr1);
                             if (!nombre || !apellido || !anio || !materia) { strcpy(response, "ERROR|Sintaxis: INSERT|<Nombre>|<Apellido>|<Anio>|<Materia>"); }
                             else {
-                                toUpperCase(nombre); toUpperCase(apellido); toUpperCase(materia);
-                                int new_id = find_first_free_id(current_data_source);
-                                char line[1024];
-                                while(fgets(line, sizeof(line), source)) fputs(line, dest);
-                                fprintf(dest, "%d;%s;%s;%s;%s\n", new_id, nombre, apellido, anio, materia);
-                                sprintf(response, "OK|Registro insertado temporalmente con ID %d.", new_id);
+                                int duplicate_id = -1;
+                                char new_record_data[1024];
+                                sprintf(new_record_data, "%s;%s;%s;%s", nombre, apellido, anio, materia);
+                                
+                                FILE *check_fs = fopen(current_data_source, "r");
+                                if(check_fs) {
+                                    char line[1024];
+                                    fgets(line, sizeof(line), check_fs);
+                                    while(fgets(line, sizeof(line), check_fs)) {
+                                        char *line_copy = strdup(line);
+                                        char *saveptr2;
+                                        char *id_part = strtok_r(line_copy, ";", &saveptr2);
+                                        char *data_part = strtok_r(NULL, "", &saveptr2);
+                                        if (data_part) {
+                                            data_part[strcspn(data_part, "\r\n")] = 0;
+                                            if (strcasecmp(data_part, new_record_data) == 0) {
+                                                duplicate_id = atoi(id_part);
+                                                break;
+                                            }
+                                        }
+                                        free(line_copy);
+                                    }
+                                    fclose(check_fs);
+                                }
+                                
+                                if (duplicate_id != -1) {
+                                    sprintf(response, "INFO|Este registro ya existe con el ID %d. No se ha insertado.", duplicate_id);
+                                } else {
+                                    int new_id = find_first_free_id(current_data_source);
+                                    char line_to_copy[1024];
+                                    rewind(source);
+                                    while(fgets(line_to_copy, sizeof(line_to_copy), source)) fputs(line_to_copy, dest);
+                                    fprintf(dest, "%d;%s;%s;%s;%s\n", new_id, nombre, apellido, anio, materia);
+                                    sprintf(response, "OK|Registro insertado temporalmente con ID %d.", new_id);
+                                    operation_successful = true;
+                                }
                             }
-                        } else if (strcasecmp(command, "DELETE") == 0) {
-                            char *id_str = strtok_r(NULL, "|", &saveptr1); char *nombre = strtok_r(NULL, "|", &saveptr1);
-                            char *apellido = strtok_r(NULL, "|", &saveptr1); char *anio = strtok_r(NULL, "|", &saveptr1);
-                            char *materia = strtok_r(NULL, "|", &saveptr1);
-                            if (!id_str || !nombre || !apellido || !anio || !materia) { strcpy(response, "ERROR|Sintaxis: DELETE|<ID>|<Nombre>|<Apellido>|<Anio>|<Materia>"); }
+                        } else if (strcasecmp(command, "DELETE_CONFIRMED") == 0) {
+                            char *full_record = strtok_r(NULL, "", &saveptr1);
+                            if (!full_record) { strcpy(response, "ERROR|Comando DELETE_CONFIRMED incompleto."); }
                             else {
-                                toUpperCase(nombre); toUpperCase(apellido); toUpperCase(materia);
                                 char line[1024]; int deleted = 0;
                                 fputs(csv_header, dest); fprintf(dest, "\n");
                                 fgets(line, sizeof(line), source); 
+                                while(fgets(line, sizeof(line), source)) {
+                                    line[strcspn(line, "\r\n")] = 0;
+                                    if (strcmp(line, full_record) == 0) {
+                                        deleted = 1; 
+                                    } else {
+                                        fputs(line, dest); fprintf(dest, "\n"); 
+                                    }
+                                }
+                                if(deleted) { strcpy(response, "OK|Registro eliminado temporalmente."); operation_successful = true; }
+                                else { strcpy(response, "ERROR|No se encontró el registro para eliminar (pudo ser modificado)."); }
+                            }
+                        } else if (strcasecmp(command, "DELETE") == 0) {
+                            char *id_str = strtok_r(NULL, "|", &saveptr1);
+                            if (!id_str) { strcpy(response, "ERROR|Sintaxis: DELETE|<ID>"); }
+                            else {
+                                char line[1024]; int found = 0;
+                                fgets(line, sizeof(line), source);
                                 while(fgets(line, sizeof(line), source)) {
                                     line[strcspn(line, "\r\n")] = 0;
                                     char line_copy[1024]; strcpy(line_copy, line);
                                     char *saveptr2;
                                     char *line_id = strtok_r(line_copy, ";", &saveptr2);
                                     if (strcmp(line_id, id_str) == 0) {
-                                        char full_record_to_match[1024];
-                                        sprintf(full_record_to_match, "%s;%s;%s;%s;%s", id_str, nombre, apellido, anio, materia);
-                                        if (strcmp(line, full_record_to_match) == 0) {
-                                            deleted = 1; 
-                                        } else {
-                                            fputs(line, dest); fprintf(dest, "\n"); 
-                                        }
-                                    } else {
-                                        fputs(line, dest); fprintf(dest, "\n");
+                                        sprintf(response, "CONFIRM_DELETE|%s", line);
+                                        found = 1;
+                                        break;
                                     }
                                 }
-                                if(deleted) sprintf(response, "OK|Registro con ID %s eliminado temporalmente.", id_str);
-                                else sprintf(response, "ERROR|No se encontró un registro que coincida con todos los datos para el ID %s.", id_str);
+                                if (!found) sprintf(response, "INFO|No se encontró ningún registro con el ID %s", id_str);
+                                response_sent = true;
+                                send(client_socket, response, strlen(response), 0);
                             }
-                        } else if (strcasecmp(command, "UPDATE") == 0) {
+                        }
+                        else if (strcasecmp(command, "UPDATE") == 0) {
                             char *id_str = strtok_r(NULL, "|", &saveptr1); char *col_name = strtok_r(NULL, "|", &saveptr1);
                             char *new_val = strtok_r(NULL, "|", &saveptr1);
                             if (!id_str || !col_name || !new_val) { strcpy(response, "ERROR|Sintaxis: UPDATE|<ID>|<columna>|<nuevo_valor>"); }
@@ -271,40 +306,89 @@ void *handle_client(void *args) {
                                 int col_idx = get_column_index(col_name);
                                 if (col_idx == -1) { sprintf(response, "ERROR|Nombre de columna '%s' no válido.", col_name); }
                                 else {
-                                    if (col_idx != get_column_index("ID") && col_idx != get_column_index("Anio")) {
-                                        toUpperCase(new_val);
-                                    }
-                                    char line[1024]; int updated = 0;
-                                    fputs(csv_header, dest); fprintf(dest, "\n");
-                                    fgets(line, sizeof(line), source); 
-                                    while(fgets(line, sizeof(line), source)) {
-                                        line[strcspn(line, "\r\n")] = 0;
-                                        char line_copy[1024]; strcpy(line_copy, line);
+                                    char line_to_update[1024]; bool record_found = false;
+                                    rewind(source);
+                                    fgets(line_to_update, sizeof(line_to_update), source);
+                                    while(fgets(line_to_update, sizeof(line_to_update), source)) {
+                                        line_to_update[strcspn(line_to_update, "\r\n")] = 0;
+                                        char line_copy[1024]; strcpy(line_copy, line_to_update);
                                         char *saveptr2;
                                         char *line_id = strtok_r(line_copy, ";", &saveptr2);
-                                        if (strcmp(line_id, id_str) == 0) {
-                                            char *fields[MAX_COLS]; int i = 0;
-                                            strcpy(line_copy, line);
-                                            char *token, *saveptr3;
-                                            token = strtok_r(line_copy, ";", &saveptr3);
-                                            while(token && i < column_count) { fields[i++] = token; token = strtok_r(NULL, ";", &saveptr3); }
-                                            fields[col_idx] = new_val;
-                                            for(int j=0; j<column_count; j++) fprintf(dest, "%s%s", fields[j], (j == column_count - 1 ? "" : ";"));
-                                            fprintf(dest, "\n");
-                                            updated = 1;
+                                        if (strcmp(line_id, id_str) == 0) { record_found = true; break; }
+                                    }
+
+                                    if (!record_found) { sprintf(response, "INFO|No se encontró el registro con ID %s para actualizar.", id_str); }
+                                    else {
+                                        char *fields[MAX_COLS]; int i = 0;
+                                        char line_copy[1024]; strcpy(line_copy, line_to_update);
+                                        char *token, *saveptr3;
+                                        token = strtok_r(line_copy, ";", &saveptr3);
+                                        while(token && i < column_count) { fields[i++] = token; token = strtok_r(NULL, ";", &saveptr3); }
+                                        fields[col_idx] = new_val;
+
+                                        char potential_new_data[1024];
+                                        sprintf(potential_new_data, "%s;%s;%s;%s", fields[1], fields[2], fields[3], fields[4]);
+
+                                        int duplicate_id = -1;
+                                        FILE *check_fs = fopen(current_data_source, "r");
+                                        if (check_fs) {
+                                            char check_line[1024];
+                                            fgets(check_line, sizeof(check_line), check_fs);
+                                            while(fgets(check_line, sizeof(check_line), check_fs)) {
+                                                char *check_line_copy = strdup(check_line);
+                                                char *saveptr4;
+                                                char *id_part = strtok_r(check_line_copy, ";", &saveptr4);
+                                                if (strcmp(id_part, id_str) != 0) {
+                                                    char *data_part = strtok_r(NULL, "", &saveptr4);
+                                                    if (data_part) {
+                                                        data_part[strcspn(data_part, "\r\n")] = 0;
+                                                        if (strcasecmp(data_part, potential_new_data) == 0) {
+                                                            duplicate_id = atoi(id_part);
+                                                            break;
+                                                        }
+                                                    }
+                                                }
+                                                free(check_line_copy);
+                                            }
+                                            fclose(check_fs);
+                                        }
+
+                                        if (duplicate_id != -1) {
+                                            sprintf(response, "INFO|La actualización crearía un registro duplicado que ya existe con el ID %d.", duplicate_id);
                                         } else {
-                                            fputs(line, dest); fprintf(dest, "\n");
+                                            rewind(source);
+                                            fputs(csv_header, dest); fprintf(dest, "\n");
+                                            fgets(line_to_update, sizeof(line_to_update), source);
+                                            while(fgets(line_to_update, sizeof(line_to_update), source)) {
+                                                line_to_update[strcspn(line_to_update, "\r\n")] = 0;
+                                                char copy[1024]; strcpy(copy, line_to_update);
+                                                char* id_part_tok, *saveptr_tok;
+                                                id_part_tok = strtok_r(copy, ";", &saveptr_tok);
+                                                if (strcmp(id_part_tok, id_str) == 0) {
+                                                    for(int j=0; j<column_count; j++) fprintf(dest, "%s%s", fields[j], (j == column_count - 1 ? "" : ";"));
+                                                    fprintf(dest, "\n");
+                                                } else {
+                                                    fputs(line_to_update, dest); fprintf(dest, "\n");
+                                                }
+                                            }
+                                            sprintf(response, "OK|Registro con ID %s actualizado temporalmente.", id_str);
+                                            operation_successful = true;
                                         }
                                     }
-                                    if(updated) sprintf(response, "OK|Registro con ID %s actualizado temporalmente.", id_str);
-                                    else sprintf(response, "INFO|No se encontró el registro con ID %s para actualizar.", id_str);
                                 }
                             }
                         }
-                        fclose(source); fclose(dest);
-                        remove(temp_file_name); 
-                        rename(next_temp_file, temp_file_name); 
-                        strcpy(current_data_source, temp_file_name);
+                        
+                        if (source) fclose(source);
+                        if (dest) fclose(dest);
+
+                        if (operation_successful) {
+                            if(strcmp(current_data_source, CSV_FILE) != 0) remove(current_data_source);
+                            rename(next_temp_file, temp_file_name); 
+                            strcpy(current_data_source, temp_file_name);
+                        } else {
+                            remove(next_temp_file);
+                        }
                     }
                 }
             }
@@ -339,7 +423,6 @@ void *handle_client(void *args) {
                     int col_index = get_column_index(column_to_find);
                     if (col_index == -1) { sprintf(response, "ERROR|Nombre de columna '%s' no válido.", column_to_find); }
                     else {
-                        toUpperCase(value_to_find);
                         FILE *fs = fopen(source_to_read, "r");
                         if (fs) {
                             char line_buffer[1024]; int matches = 0;
@@ -353,7 +436,7 @@ void *handle_client(void *args) {
                                 while (field != NULL) {
                                     if (current_col == col_index) {
                                         field[strcspn(field, "\r\n")] = 0;
-                                        if (strcmp(field, value_to_find) == 0) { found_in_line = 1; }
+                                        if (strcasecmp(field, value_to_find) == 0) { found_in_line = 1; }
                                         break;
                                     }
                                     field = strtok_r(NULL, ";", &saveptr2); current_col++;
@@ -371,14 +454,17 @@ void *handle_client(void *args) {
                 }
             }
         } else if (strcmp(temp_buffer, "EXIT") == 0) { break; }
-        send(client_socket, response, strlen(response), 0);
+        
+        if (!response_sent) {
+             send(client_socket, response, strlen(response), 0);
+        }
     }
     
     get_timestamp(timestamp, sizeof(timestamp));
     printf("%s >> Cliente %s:%d desconectado.\n", timestamp, client_ip, client_port);
     if (in_transaction) {
         printf("%s >> Cliente %s:%d desconectado en transacción. Revirtiendo cambios.\n", timestamp, client_ip, client_port);
-        remove(temp_file_name);
+        if(strcmp(current_data_source, CSV_FILE) != 0) remove(current_data_source);
         struct flock lock = {.l_type = F_UNLCK, .l_whence = SEEK_SET, .l_start = 0, .l_len = 0};
         fcntl(file_fd, F_SETLK, &lock);
         pthread_mutex_unlock(&file_lock_mutex);
