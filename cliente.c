@@ -14,7 +14,7 @@
 #define CONNECTION_TIMEOUT 5
 
 void mostrar_ayuda() {
-    printf("\n--- Comandos Admitidos ---\n");
+    printf("\n--- Comandos Admitidos (no distingue mayúsculas/minúsculas) ---\n");
     printf("CONSULTAS:\n");
     printf("  FIND|ALL                      - Muestra todos los registros.\n");
     printf("  FIND|<columna>|<valor>        - Busca un valor en una columna específica.\n");
@@ -100,7 +100,7 @@ int main(int argc, char *argv[]) {
 
     printf("Conexión TCP establecida. Esperando confirmación del servidor...\n");
 
-    char status_buffer[64];
+    char status_buffer[128];
     int read_size = recv(sock, status_buffer, sizeof(status_buffer) - 1, 0);
 
     if (read_size <= 0) {
@@ -114,7 +114,7 @@ int main(int argc, char *argv[]) {
         printf("Servidor ocupado. Has sido puesto en la cola de espera...\n");
         read_size = recv(sock, status_buffer, sizeof(status_buffer) - 1, 0);
         if (read_size <= 0) {
-            printf("Se perdió la conexión con el servidor, intente nuevamente.\n");
+            printf("Se perdió la conexión con el servidor mientras esperabas.\n");
             close(sock);
             return 1;
         }

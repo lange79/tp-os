@@ -11,10 +11,12 @@
 #include <errno.h>
 #include <sys/select.h>
 #include <limits.h>
-#include <strings.h> // Para strcasecmp
+#include <strings.h>
+#include <time.h>
+#include <ctype.h> // Para toupper()
 
 #define MAX_BUFFER 2048
-#define CSV_FILE "datos.csv"
+#define CSV_FILE "alumnos.csv" // <<-- NOMBRE DE ARCHIVO ACTUALIZADO
 #define MAX_COLS 10
 
 // --- Variables globales para el estado del servidor ---
@@ -36,20 +38,35 @@ typedef struct {
     struct sockaddr_in client_address;
 } thread_args_t;
 
-int file_fd; // Descriptor de archivo para el bloqueo fcntl
-pthread_mutex_t file_lock_mutex = PTHREAD_MUTEX_INITIALIZER; // Mutex para el bloqueo fcntl
+int file_fd;
+pthread_mutex_t file_lock_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+// --- Nueva función para Timestamps ---
+void get_timestamp(char *buffer, size_t size) {
+    time_t now = time(NULL);
+    struct tm *t = localtime(&now);
+    strftime(buffer, size, "[%H:%M:%S]", t);
+}
+
+// --- Nueva función para normalizar a Mayúsculas ---
+void toUpperCase(char *str) {
+    for (int i = 0; str[i]; i++) {
+        str[i] = toupper((unsigned char)str[i]);
+    }
+}
 
 void print_server_status() {
-    printf("\n\n================ STATUS ==============\n");
-    printf("Clientes conectados : %d/%d\n", active_clients_count, max_concurrent_clients_config);
-    printf("Clientes en cola    : %d/%d\n", waiting_clients_count, max_waiting_clients_config);
-    printf("======================================\n\n");
+    char timestamp[12];
+    get_timestamp(timestamp, sizeof(timestamp));
+    printf("\n\n%s ================ STATUS ================\n", timestamp);
+    printf("%s Clientes conectados : %d/%d\n", timestamp, active_clients_count, max_concurrent_clients_config);
+    printf("%s Clientes en cola    : %d/%d\n", timestamp, waiting_clients_count, max_waiting_clients_config);
+    printf("%s ========================================\n\n", timestamp);
 }
 
 void load_csv_header() {
     FILE *fs = fopen(CSV_FILE, "r");
     if (fs == NULL) return;
-
     if (fgets(csv_header, sizeof(csv_header), fs)) {
         csv_header[strcspn(csv_header, "\r\n")] = 0;
         char header_copy[1024];
@@ -62,7 +79,9 @@ void load_csv_header() {
         }
     }
     fclose(fs);
-    printf(">> Cabeceras del CSV cargadas: %d columnas.\n", column_count);
+    char timestamp[12];
+    get_timestamp(timestamp, sizeof(timestamp));
+    printf("%s >> Cabeceras del CSV cargadas: %d columnas.\n", timestamp, column_count);
 }
 
 int get_column_index(const char *col_name) {
@@ -77,7 +96,7 @@ int find_first_free_id(const char* filename) {
     if (!fs) return 1;
     char line[1024];
     char seen_ids[USHRT_MAX] = {0};
-    fgets(line, sizeof(line), fs); // Skip header
+    fgets(line, sizeof(line), fs);
     while (fgets(line, sizeof(line), fs)) {
         int id = atoi(line);
         if (id > 0 && id < USHRT_MAX) seen_ids[id] = 1;
@@ -96,6 +115,7 @@ void *handle_client(void *args) {
     int in_transaction = 0;
     char temp_file_name[256];
     char current_data_source[256];
+    char timestamp[12];
 
     char client_ip[INET_ADDRSTRLEN];
     inet_ntop(AF_INET, &(thread_args->client_address.sin_addr), client_ip, INET_ADDRSTRLEN);
@@ -103,7 +123,8 @@ void *handle_client(void *args) {
 
     pthread_mutex_lock(&count_mutex);
     if (waiting_clients_count >= max_waiting_clients_config) {
-        printf(">> Conexión de %s:%d rechazada: Cola de espera llena.\n", client_ip, client_port);
+        get_timestamp(timestamp, sizeof(timestamp));
+        printf("%s >> Conexión de %s:%d rechazada: Cola de espera llena.\n", timestamp, client_ip, client_port);
         send(client_socket, "ERROR|Cola de espera llena. Intente más tarde.", 46, 0);
         pthread_mutex_unlock(&count_mutex);
         close(client_socket);
@@ -114,7 +135,8 @@ void *handle_client(void *args) {
     while (active_clients_count >= max_concurrent_clients_config && !shutdown_flag) {
         send(client_socket, "STATUS|QUEUED", 13, 0);
         waiting_clients_count++;
-        printf(">> Cliente %s:%d puesto en cola de espera.\n", client_ip, client_port);
+        get_timestamp(timestamp, sizeof(timestamp));
+        printf("%s >> Cliente %s:%d puesto en cola de espera.\n", timestamp, client_ip, client_port);
         print_server_status();
         pthread_cond_wait(&queue_cond, &count_mutex);
         waiting_clients_count--;
@@ -128,7 +150,8 @@ void *handle_client(void *args) {
     }
     active_clients_count++;
     send(client_socket, "STATUS|CONNECTED", 16, 0);
-    printf(">> Cliente %s:%d activado.\n", client_ip, client_port);
+    get_timestamp(timestamp, sizeof(timestamp));
+    printf("%s >> Cliente %s:%d activado.\n", timestamp, client_ip, client_port);
     print_server_status();
     pthread_mutex_unlock(&count_mutex);
 
@@ -136,7 +159,8 @@ void *handle_client(void *args) {
     while (!shutdown_flag && (read_size = recv(client_socket, buffer, MAX_BUFFER, 0)) > 0) {
         buffer[read_size] = '\0';
         buffer[strcspn(buffer, "\r\n")] = 0;
-        printf("Recibido de %s:%d: %s\n", client_ip, client_port, buffer);
+        get_timestamp(timestamp, sizeof(timestamp));
+        printf("%s Recibido de %s:%d: %s\n", timestamp, client_ip, client_port, buffer);
         char response[MAX_BUFFER] = "ERROR|Comando desconocido";
         char temp_buffer[MAX_BUFFER];
         strcpy(temp_buffer, buffer);
@@ -153,7 +177,7 @@ void *handle_client(void *args) {
                         strcpy(response, "ERROR|Fallo al bloquear el archivo.");
                         pthread_mutex_unlock(&file_lock_mutex);
                     } else {
-                        sprintf(temp_file_name, "datos_%ld.tmp", (long)pthread_self());
+                        sprintf(temp_file_name, "alumnos_%ld.tmp", (long)pthread_self());
                         strcpy(current_data_source, CSV_FILE);
                         in_transaction = 1;
                         strcpy(response, "OK|Transacción iniciada.");
@@ -202,6 +226,7 @@ void *handle_client(void *args) {
                             char *anio = strtok_r(NULL, "|", &saveptr1); char *materia = strtok_r(NULL, "|", &saveptr1);
                             if (!nombre || !apellido || !anio || !materia) { strcpy(response, "ERROR|Sintaxis: INSERT|<Nombre>|<Apellido>|<Anio>|<Materia>"); }
                             else {
+                                toUpperCase(nombre); toUpperCase(apellido); toUpperCase(materia);
                                 int new_id = find_first_free_id(current_data_source);
                                 char line[1024];
                                 while(fgets(line, sizeof(line), source)) fputs(line, dest);
@@ -214,6 +239,7 @@ void *handle_client(void *args) {
                             char *materia = strtok_r(NULL, "|", &saveptr1);
                             if (!id_str || !nombre || !apellido || !anio || !materia) { strcpy(response, "ERROR|Sintaxis: DELETE|<ID>|<Nombre>|<Apellido>|<Anio>|<Materia>"); }
                             else {
+                                toUpperCase(nombre); toUpperCase(apellido); toUpperCase(materia);
                                 char line[1024]; int deleted = 0;
                                 fputs(csv_header, dest); fprintf(dest, "\n");
                                 fgets(line, sizeof(line), source); 
@@ -245,6 +271,9 @@ void *handle_client(void *args) {
                                 int col_idx = get_column_index(col_name);
                                 if (col_idx == -1) { sprintf(response, "ERROR|Nombre de columna '%s' no válido.", col_name); }
                                 else {
+                                    if (col_idx != get_column_index("ID") && col_idx != get_column_index("Anio")) {
+                                        toUpperCase(new_val);
+                                    }
                                     char line[1024]; int updated = 0;
                                     fputs(csv_header, dest); fprintf(dest, "\n");
                                     fgets(line, sizeof(line), source); 
@@ -280,60 +309,64 @@ void *handle_client(void *args) {
                 }
             }
         } else if (strncmp(temp_buffer, "FIND", 4) == 0) {
-            struct flock lock_check;
-            lock_check.l_type = F_WRLCK; lock_check.l_whence = SEEK_SET; lock_check.l_start = 0; lock_check.l_len = 0;
-            fcntl(file_fd, F_GETLK, &lock_check);
-            if (lock_check.l_type != F_UNLCK && !in_transaction) { strcpy(response, "ERROR|Hay una transacción activa. No se pueden realizar consultas."); }
-            else {
-                const char *source_to_read = in_transaction ? current_data_source : CSV_FILE;
-                char *argument = strtok_r(temp_buffer, "|", &saveptr1) ? strtok_r(NULL, "|", &saveptr1) : NULL;
-                if (argument != NULL && strcasecmp(argument, "ALL") == 0) {
-                    FILE *fs = fopen(source_to_read, "r");
-                    if (fs) {
-                        char line_buffer[1024];
-                        fgets(line_buffer, sizeof(line_buffer), fs);
-                        sprintf(response, "DATA|\n%s\n", csv_header);
-                        while(fgets(line_buffer, sizeof(line_buffer), fs) != NULL) {
-                            if(strlen(response) + strlen(line_buffer) < MAX_BUFFER) { strcat(response, line_buffer); }
-                            else { strcat(response, "...\n[DATA TRUNCATED]"); break; }
-                        }
-                        fclose(fs);
-                    } else { strcpy(response, "ERROR|No se pudo abrir el archivo de datos."); }
-                } else {
-                    char *column_to_find = argument; char *value_to_find = strtok_r(NULL, "|", &saveptr1);
-                    if (!column_to_find || !value_to_find) { strcpy(response, "ERROR|Sintaxis incorrecta. Use FIND|<columna>|<valor>."); }
+            if (in_transaction) {} 
+            else if (pthread_mutex_trylock(&file_lock_mutex) != 0) {
+                strcpy(response, "ERROR|Hay una transacción activa. No se pueden realizar consultas.");
+                send(client_socket, response, strlen(response), 0);
+                continue;
+            } else {
+                pthread_mutex_unlock(&file_lock_mutex);
+            }
+
+            const char *source_to_read = in_transaction ? current_data_source : CSV_FILE;
+            char *argument = strtok_r(temp_buffer, "|", &saveptr1) ? strtok_r(NULL, "|", &saveptr1) : NULL;
+            if (argument != NULL && strcasecmp(argument, "ALL") == 0) {
+                FILE *fs = fopen(source_to_read, "r");
+                if (fs) {
+                    char line_buffer[1024];
+                    fgets(line_buffer, sizeof(line_buffer), fs);
+                    sprintf(response, "DATA|\n%s\n", csv_header);
+                    while(fgets(line_buffer, sizeof(line_buffer), fs) != NULL) {
+                        if(strlen(response) + strlen(line_buffer) < MAX_BUFFER) { strcat(response, line_buffer); }
+                        else { strcat(response, "...\n[DATA TRUNCATED]"); break; }
+                    }
+                    fclose(fs);
+                } else { strcpy(response, "ERROR|No se pudo abrir el archivo de datos."); }
+            } else {
+                char *column_to_find = argument; char *value_to_find = strtok_r(NULL, "|", &saveptr1);
+                if (!column_to_find || !value_to_find) { strcpy(response, "ERROR|Sintaxis incorrecta. Use FIND|<columna>|<valor>."); }
+                else {
+                    int col_index = get_column_index(column_to_find);
+                    if (col_index == -1) { sprintf(response, "ERROR|Nombre de columna '%s' no válido.", column_to_find); }
                     else {
-                        int col_index = get_column_index(column_to_find);
-                        if (col_index == -1) { sprintf(response, "ERROR|Nombre de columna '%s' no válido.", column_to_find); }
-                        else {
-                            FILE *fs = fopen(source_to_read, "r");
-                            if (fs) {
-                                char line_buffer[1024]; int matches = 0;
-                                sprintf(response, "DATA|\n%s\n", csv_header);
-                                fgets(line_buffer, sizeof(line_buffer), fs);
-                                while(fgets(line_buffer, sizeof(line_buffer), fs) != NULL) {
-                                    char *line_copy = strdup(line_buffer); 
-                                    char *saveptr2;
-                                    char *field = strtok_r(line_copy, ";", &saveptr2);
-                                    int current_col = 0; int found_in_line = 0;
-                                    while (field != NULL) {
-                                        if (current_col == col_index) {
-                                            field[strcspn(field, "\r\n")] = 0;
-                                            if (strcasecmp(field, value_to_find) == 0) { found_in_line = 1; }
-                                            break;
-                                        }
-                                        field = strtok_r(NULL, ";", &saveptr2); current_col++;
+                        toUpperCase(value_to_find);
+                        FILE *fs = fopen(source_to_read, "r");
+                        if (fs) {
+                            char line_buffer[1024]; int matches = 0;
+                            sprintf(response, "DATA|\n%s\n", csv_header);
+                            fgets(line_buffer, sizeof(line_buffer), fs);
+                            while(fgets(line_buffer, sizeof(line_buffer), fs) != NULL) {
+                                char *line_copy = strdup(line_buffer); 
+                                char *saveptr2;
+                                char *field = strtok_r(line_copy, ";", &saveptr2);
+                                int current_col = 0; int found_in_line = 0;
+                                while (field != NULL) {
+                                    if (current_col == col_index) {
+                                        field[strcspn(field, "\r\n")] = 0;
+                                        if (strcmp(field, value_to_find) == 0) { found_in_line = 1; }
+                                        break;
                                     }
-                                    free(line_copy);
-                                    if (found_in_line) {
-                                        if(strlen(response) + strlen(line_buffer) < MAX_BUFFER) { strcat(response, line_buffer); matches++; }
-                                        else { strcat(response, "...\n[DATA TRUNCATED]"); break; }
-                                    }
+                                    field = strtok_r(NULL, ";", &saveptr2); current_col++;
                                 }
-                                fclose(fs);
-                                if (matches == 0) { strcpy(response, "INFO|No se encontraron coincidencias."); }
-                            } else { strcpy(response, "ERROR|No se pudo abrir el archivo de datos."); }
-                        }
+                                free(line_copy);
+                                if (found_in_line) {
+                                    if(strlen(response) + strlen(line_buffer) < MAX_BUFFER) { strcat(response, line_buffer); matches++; }
+                                    else { strcat(response, "...\n[DATA TRUNCATED]"); break; }
+                                }
+                            }
+                            fclose(fs);
+                            if (matches == 0) { strcpy(response, "INFO|No se encontraron coincidencias."); }
+                        } else { strcpy(response, "ERROR|No se pudo abrir el archivo de datos."); }
                     }
                 }
             }
@@ -341,9 +374,10 @@ void *handle_client(void *args) {
         send(client_socket, response, strlen(response), 0);
     }
     
-    printf(">> Cliente %s:%d desconectado.\n", client_ip, client_port);
+    get_timestamp(timestamp, sizeof(timestamp));
+    printf("%s >> Cliente %s:%d desconectado.\n", timestamp, client_ip, client_port);
     if (in_transaction) {
-        printf(">> Cliente %s:%d desconectado en transacción. Revirtiendo cambios.\n", client_ip, client_port);
+        printf("%s >> Cliente %s:%d desconectado en transacción. Revirtiendo cambios.\n", timestamp, client_ip, client_port);
         remove(temp_file_name);
         struct flock lock = {.l_type = F_UNLCK, .l_whence = SEEK_SET, .l_start = 0, .l_len = 0};
         fcntl(file_fd, F_SETLK, &lock);
@@ -381,7 +415,9 @@ int main(int argc, char *argv[]) {
     server_addr.sin_port = htons(port);
     if (bind(server_socket, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) { perror("Error en bind"); exit(EXIT_FAILURE); }
     listen(server_socket, max_waiting_clients_config);
-    printf("Servidor iniciado. Escriba 'EXIT' y presione Enter para apagar.\n");
+    char timestamp[12];
+    get_timestamp(timestamp, sizeof(timestamp));
+    printf("%s Servidor iniciado. Escriba 'EXIT' y presione Enter para apagar.\n", timestamp);
     print_server_status();
     
     fd_set read_fds;
@@ -398,7 +434,8 @@ int main(int argc, char *argv[]) {
             char command[256];
             if (read(STDIN_FILENO, command, sizeof(command)) > 0) {
                 if (strncmp(command, "EXIT", 4) == 0) {
-                    printf(">> Apagando el servidor...\n");
+                    get_timestamp(timestamp, sizeof(timestamp));
+                    printf("%s >> Apagando el servidor...\n", timestamp);
                     shutdown_flag = 1;
                     break;
                 }
@@ -427,6 +464,7 @@ int main(int argc, char *argv[]) {
     sleep(1);
     close(file_fd);
     close(server_socket);
-    printf(">> Servidor apagado.\n");
+    get_timestamp(timestamp, sizeof(timestamp));
+    printf("%s >> Servidor apagado.\n", timestamp);
     return 0;
 }
