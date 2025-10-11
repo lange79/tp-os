@@ -15,10 +15,12 @@
 #include <time.h>
 #include <ctype.h>
 #include <stdbool.h>
+#include <signal.h>
 
 #define MAX_BUFFER 2048
 #define CSV_FILE "alumnos.csv"
 #define MAX_COLS 10
+#define MAX_CLIENTS 1024
 
 // --- Variables globales para el estado del servidor ---
 int active_clients_count = 0;
@@ -28,6 +30,10 @@ int max_waiting_clients_config;
 volatile int shutdown_flag = 0;
 pthread_mutex_t count_mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_cond_t queue_cond = PTHREAD_COND_INITIALIZER;
+
+// --- Variables para el manejo de hilos "unibles" ---
+pthread_t active_threads[MAX_CLIENTS];
+pthread_mutex_t thread_list_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 // --- Variables globales para la estructura del CSV ---
 char *column_names[MAX_COLS];
@@ -42,10 +48,23 @@ typedef struct {
 int file_fd;
 pthread_mutex_t file_lock_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+// << CORRECCIÓN: Definición de get_timestamp ANTES de su uso >>
 void get_timestamp(char *buffer, size_t size) {
     time_t now = time(NULL);
     struct tm *t = localtime(&now);
     strftime(buffer, size, "[%H:%M:%S]", t);
+}
+
+// --- Función manejadora de señales ---
+void signal_handler(int signum) {
+    char timestamp[12];
+    get_timestamp(timestamp, sizeof(timestamp));
+    // Escribir directamente a la salida estándar es más seguro en un manejador
+    write(STDOUT_FILENO, "\n", 1);
+    write(STDOUT_FILENO, timestamp, strlen(timestamp));
+    char* msg = " >> Señal de terminación recibida. Iniciando apagado controlado...\n";
+    write(STDOUT_FILENO, msg, strlen(msg));
+    shutdown_flag = 1;
 }
 
 void print_server_status() {
@@ -114,6 +133,11 @@ void *handle_client(void *args) {
     inet_ntop(AF_INET, &(thread_args->client_address.sin_addr), client_ip, INET_ADDRSTRLEN);
     int client_port = ntohs(thread_args->client_address.sin_port);
 
+    struct timeval tv;
+    tv.tv_sec = 1;
+    tv.tv_usec = 0;
+    setsockopt(client_socket, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof tv);
+
     pthread_mutex_lock(&count_mutex);
     if (waiting_clients_count >= max_waiting_clients_config) {
         get_timestamp(timestamp, sizeof(timestamp));
@@ -149,7 +173,15 @@ void *handle_client(void *args) {
     pthread_mutex_unlock(&count_mutex);
 
     int read_size;
-    while (!shutdown_flag && (read_size = recv(client_socket, buffer, MAX_BUFFER, 0)) > 0) {
+    while (!shutdown_flag) {
+        read_size = recv(client_socket, buffer, MAX_BUFFER, 0);
+
+        if(read_size < 0){
+            if(errno == EAGAIN || errno == EWOULDBLOCK){ continue; }
+            break;
+        }
+        if(read_size == 0){ break; }
+
         buffer[read_size] = '\0';
         buffer[strcspn(buffer, "\r\n")] = 0;
         get_timestamp(timestamp, sizeof(timestamp));
@@ -470,6 +502,16 @@ void *handle_client(void *args) {
         pthread_mutex_unlock(&file_lock_mutex);
     }
     close(client_socket); free(args);
+
+    pthread_mutex_lock(&thread_list_mutex);
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        if (active_threads[i] == pthread_self()) {
+            active_threads[i] = 0;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&thread_list_mutex);
+
     pthread_mutex_lock(&count_mutex);
     active_clients_count--;
     pthread_cond_signal(&queue_cond);
@@ -484,6 +526,18 @@ int main(int argc, char *argv[]) {
     int port = atoi(argv[1]);
     max_concurrent_clients_config = atoi(argv[2]);
     max_waiting_clients_config = atoi(argv[3]);
+
+    if (max_concurrent_clients_config > MAX_CLIENTS) {
+        fprintf(stderr, "Error: El número de clientes concurrentes no puede exceder %d.\n", MAX_CLIENTS);
+        return 1;
+    }
+    
+    struct sigaction sa;
+    sa.sa_handler = signal_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
 
     if (access(CSV_FILE, F_OK) == -1) { fprintf(stderr, "Error: No se encuentra la base de datos ('%s').\n", CSV_FILE); return 1; }
     load_csv_header();
@@ -503,7 +557,7 @@ int main(int argc, char *argv[]) {
     listen(server_socket, max_waiting_clients_config);
     char timestamp[12];
     get_timestamp(timestamp, sizeof(timestamp));
-    printf("%s Servidor iniciado. Escriba 'EXIT' y presione Enter para apagar.\n", timestamp);
+    printf("%s Servidor iniciado. Escriba 'EXIT' o presione Ctrl+C para apagar.\n", timestamp);
     print_server_status();
     
     fd_set read_fds;
@@ -521,36 +575,54 @@ int main(int argc, char *argv[]) {
             if (read(STDIN_FILENO, command, sizeof(command)) > 0) {
                 if (strncmp(command, "EXIT", 4) == 0) {
                     get_timestamp(timestamp, sizeof(timestamp));
-                    printf("%s >> Apagando el servidor...\n", timestamp);
+                    printf("%s >> Comando EXIT recibido. Iniciando apagado controlado...\n", timestamp);
                     shutdown_flag = 1;
-                    break;
                 }
             }
         }
-        if (FD_ISSET(server_socket, &read_fds)) {
+        if (FD_ISSET(server_socket, &read_fds) && !shutdown_flag) {
             struct sockaddr_in client_addr;
             socklen_t client_len = sizeof(client_addr);
             int client_socket = accept(server_socket, (struct sockaddr *)&client_addr, &client_len);
-            if (client_socket < 0) { perror("accept failed"); continue; }
-            pthread_t thread_id;
-            thread_args_t *args = malloc(sizeof(thread_args_t));
-            args->client_socket = client_socket;
-            args->client_address = client_addr;
-            if (pthread_create(&thread_id, NULL, handle_client, (void *)args) != 0) {
-                perror("No se pudo crear el hilo");
-                free(args);
+            if (client_socket < 0) { continue; }
+            
+            pthread_mutex_lock(&thread_list_mutex);
+            int i;
+            for (i = 0; i < MAX_CLIENTS; i++) {
+                if (active_threads[i] == 0) {
+                    thread_args_t *args = malloc(sizeof(thread_args_t));
+                    args->client_socket = client_socket;
+                    args->client_address = client_addr;
+                    if (pthread_create(&active_threads[i], NULL, handle_client, (void *)args) != 0) {
+                        perror("No se pudo crear el hilo");
+                        free(args);
+                        close(client_socket);
+                        active_threads[i] = 0;
+                    }
+                    break;
+                }
+            }
+            if (i == MAX_CLIENTS) {
+                send(client_socket, "ERROR|Demasiados hilos activos.", 30, 0);
                 close(client_socket);
             }
-            pthread_detach(thread_id);
+            pthread_mutex_unlock(&thread_list_mutex);
         }
     }
-    pthread_mutex_lock(&count_mutex);
+
+    get_timestamp(timestamp, sizeof(timestamp));
+    printf("%s >> Proceso de apagado iniciado. Esperando a que los clientes terminen...\n", timestamp);
     pthread_cond_broadcast(&queue_cond);
-    pthread_mutex_unlock(&count_mutex);
-    sleep(1);
+    
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        if (active_threads[i] != 0) {
+            pthread_join(active_threads[i], NULL);
+        }
+    }
+
     close(file_fd);
     close(server_socket);
     get_timestamp(timestamp, sizeof(timestamp));
-    printf("%s >> Servidor apagado.\n", timestamp);
+    printf("%s >> Servidor apagado limpiamente.\n", timestamp);
     return 0;
 }
